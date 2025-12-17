@@ -1,4 +1,6 @@
 import os
+import sqlite3
+import datetime
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -7,6 +9,35 @@ from dotenv import load_dotenv
 # .env からトークン読み込み
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+DB_PATH = "tasks.db"  # プロジェクト直下に作るSQLiteファイル
+
+def init_db():
+    """tasks テーブルがなければ作成する"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_user_id INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            title TEXT NOT NULL,
+            deadline TEXT NOT NULL,
+            submitted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+# DB初期化
+init_db()
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 
 # ===== 自分のサーバー / チャンネルのIDを入れる =====
 GUILD_ID = 912019792905535600  # サーバーID
@@ -37,7 +68,7 @@ async def on_ready():
 @app_commands.describe(
     subject="科目名（例：情報処理）",
     title="課題名（例：レポート1）",
-    deadline="締切（例：2025-12-20 23:59）",
+    deadline="締切（例：2025-12-20 23:59 の形式で入力）",
 )
 async def task_add(
     interaction: discord.Interaction,
@@ -45,14 +76,57 @@ async def task_add(
     title: str,
     deadline: str,
 ):
+    # 1. 締切文字列を日時に変換（フォーマットチェック）
+    try:
+        deadline_dt = datetime.datetime.strptime(deadline, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await interaction.response.send_message(
+            "締切は `YYYY-MM-DD HH:MM` 形式で入力してね。\n"
+            "例: `2025-12-20 23:59`",
+            ephemeral=True,
+        )
+        return
+
+    now = datetime.datetime.now()
+
+    # 2. DB に保存
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO tasks (
+            discord_user_id,
+            subject,
+            title,
+            deadline,
+            submitted,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, 0, ?, ?);
+        """,
+        (
+            interaction.user.id,
+            subject,
+            title,
+            deadline_dt.isoformat(),  # 例: "2025-12-20T23:59:00"
+            now.isoformat(),
+            now.isoformat(),
+        ),
+    )
+    task_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    # 3. ユーザーに確認メッセージ
     msg = (
-        f"課題を登録しました。\n"
+        f"課題を登録しました。（ID: {task_id}）\n"
         f"科目: {subject}\n"
         f"課題名: {title}\n"
-        f"締切: {deadline}"
+        f"締切: {deadline_dt.strftime('%Y-%m-%d %H:%M')}\n"
+        f"登録者: {interaction.user.display_name}"
     )
     await interaction.response.send_message(msg, ephemeral=True)
-
 
 # 通知テスト（指定チャンネルに送れるかチェック）
 @bot.tree.command(
