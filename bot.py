@@ -2,7 +2,7 @@ import os
 import sqlite3
 import datetime
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -30,6 +30,19 @@ def init_db():
         );
         """
     )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_user_id INTEGER NOT NULL,
+            notify_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            UNIQUE(discord_user_id, notify_key)
+        );
+        """
+    )
+
     conn.commit()
     conn.close()
 # DB初期化
@@ -70,6 +83,57 @@ def fetch_unsubmitted_tasks(discord_user_id: int):
     conn.close()
     return rows
 
+def was_notified(discord_user_id: int, notify_key: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM sent_notifications WHERE discord_user_id=? AND notify_key=? LIMIT 1;",
+        (discord_user_id, notify_key),
+    )
+    hit = cur.fetchone() is not None
+    conn.close()
+    return hit
+
+
+def mark_notified(discord_user_id: int, notify_key: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO sent_notifications (discord_user_id, notify_key, sent_at)
+        VALUES (?, ?, ?);
+        """,
+        (discord_user_id, notify_key, datetime.datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_active_user_ids():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT discord_user_id FROM tasks;")
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def fetch_unsubmitted_tasks_all(discord_user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, subject, title, deadline
+        FROM tasks
+        WHERE discord_user_id = ? AND submitted = 0
+        ORDER BY deadline ASC;
+        """,
+        (discord_user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -79,9 +143,8 @@ GUILD_ID = 912019792905535600  # サーバーID
 CHANNEL_ID = 1448247532047040684  # 通知を送りたいテキストチャンネルID
 # ===================================================
 
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
+DAILY_NOTIFY_HOUR = 16
+DAILY_NOTIFY_MINUTE = 43
 
 @bot.event
 async def on_ready():
@@ -92,6 +155,106 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
     except Exception as e:
         print(f"Command sync error: {e}")
+    if not deadline_notify_loop.is_running():
+        deadline_notify_loop.start()
+
+    if not daily_notify_loop.is_running():
+        daily_notify_loop.start()
+
+@tasks.loop(minutes=1)
+async def deadline_notify_loop():
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        return
+
+    now = datetime.datetime.now()
+
+    user_ids = fetch_active_user_ids()
+    for uid in user_ids:
+        rows = fetch_unsubmitted_tasks_all(uid)
+
+        # deadline(分単位)ごとにグルーピング
+        groups = {}
+        for task_id, subject, title, deadline_iso in rows:
+            try:
+                d = datetime.datetime.fromisoformat(deadline_iso)
+            except Exception:
+                continue
+            key = d.replace(second=0, microsecond=0).isoformat()
+            groups.setdefault(key, {"deadline": d.replace(second=0, microsecond=0), "items": []})
+            groups[key]["items"].append((task_id, subject, title))
+
+        # 各グループについて n時間前 を計算
+        for g in groups.values():
+            deadline_dt = g["deadline"]
+            n = len(g["items"])
+            notify_time = deadline_dt - datetime.timedelta(hours=n)
+
+            # 「今」から±30秒以内なら通知対象
+            if abs((now - notify_time).total_seconds()) <= 30:
+                notify_key = f"deadline:{notify_time.isoformat()}:{deadline_dt.isoformat()}"
+                if was_notified(uid, notify_key):
+                    continue
+
+                # メッセージ（同じ締切の課題が複数なら列挙）
+                titles = " / ".join([f"{sub}:{ttl}(ID:{tid})" for (tid, sub, ttl) in g["items"]])
+                msg = (
+                    f"<@{uid}>\n"
+                    f"{titles}\n"
+                    f"締切は本日の {deadline_dt.strftime('%H:%M')} です。未提出の場合は急いでやりましょう。"
+                )
+
+                await channel.send(msg)
+                mark_notified(uid, notify_key)
+
+@tasks.loop(minutes=1)
+async def daily_notify_loop():
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        return
+
+    now = datetime.datetime.now()
+    if not (now.hour == DAILY_NOTIFY_HOUR and now.minute == DAILY_NOTIFY_MINUTE):
+        return
+
+    today = now.date()
+    notify_day_key = today.strftime("%Y-%m-%d")
+
+    user_ids = fetch_active_user_ids()
+    for uid in user_ids:
+        notify_key = f"daily:{notify_day_key}"
+        if was_notified(uid, notify_key):
+            continue
+
+        # 今日締切の未提出を抽出
+        rows = fetch_unsubmitted_tasks_all(uid)
+        today_items = []
+        for task_id, subject, title, deadline_iso in rows:
+            try:
+                d = datetime.datetime.fromisoformat(deadline_iso)
+            except Exception:
+                continue
+            if d.date() == today:
+                today_items.append((task_id, subject, title, d))
+
+        if not today_items:
+            mark_notified(uid, notify_key)
+            continue
+
+        # 今日締切の一覧を作成（締切時刻を文に使う）
+        lines = []
+        for tid, sub, ttl, d in sorted(today_items, key=lambda x: x[3]):
+            lines.append(f"{sub}:{ttl}(ID:{tid}) → {d.strftime('%H:%M')}")
+
+        msg = (
+            f"<@{uid}>\n"
+            "本日締切の未提出課題があります。\n"
+            + "\n".join(lines)
+            + "\n未提出の場合は急いでやりましょう。"
+        )
+
+        await channel.send(msg)
+        mark_notified(uid, notify_key)
 
 
 # 課題追加（今は確認だけでDB保存はまだ）
@@ -162,7 +325,7 @@ async def task_add(
         f"登録者: {interaction.user.display_name}"
     )
     await interaction.response.send_message(msg, ephemeral=True)
-    
+
 # 未提出課題一覧表示（締切が近い順）
 @bot.tree.command(
     name="task_list",
