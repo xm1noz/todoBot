@@ -35,6 +35,23 @@ def init_db():
 # DB初期化
 init_db()
 
+def fetch_unsubmitted_tasks(discord_user_id: int):
+    """未提出タスクを締切昇順で取得"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, subject, title, deadline
+        FROM tasks
+        WHERE discord_user_id = ? AND submitted = 0
+        ORDER BY deadline ASC;
+        """,
+        (discord_user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -126,6 +143,32 @@ async def task_add(
         f"締切: {deadline_dt.strftime('%Y-%m-%d %H:%M')}\n"
         f"登録者: {interaction.user.display_name}"
     )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.tree.command(
+    name="task_list",
+    description="未提出の課題一覧を締切が近い順に表示します",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def task_list(interaction: discord.Interaction):
+    rows = fetch_unsubmitted_tasks(interaction.user.id)
+
+    if not rows:
+        await interaction.response.send_message("未提出の課題はありません。", ephemeral=True)
+        return
+
+    lines = []
+    for task_id, subject, title, deadline_iso in rows:
+        # deadline は ISO 文字列で保存している前提
+        try:
+            dt = datetime.datetime.fromisoformat(deadline_iso)
+            deadline_str = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            deadline_str = deadline_iso  # 変換できない場合はそのまま表示
+
+        lines.append(f"ID:{task_id} | {subject} | {title} | 締切:{deadline_str}")
+
+    msg = "未提出の課題一覧（締切が近い順）\n" + "\n".join(lines)
     await interaction.response.send_message(msg, ephemeral=True)
 
 # 通知テスト（指定チャンネルに送れるかチェック）
