@@ -35,6 +35,24 @@ def init_db():
 # DB初期化
 init_db()
 
+def mark_task_submitted(discord_user_id: int, task_id: int) -> bool:
+    """指定IDのタスクを submitted=1 にする（本人のタスクのみ）。更新できたら True"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE tasks
+        SET submitted = 1, updated_at = ?
+        WHERE id = ? AND discord_user_id = ? AND submitted = 0;
+        """,
+        (datetime.datetime.now().isoformat(), task_id, discord_user_id),
+    )
+    updated = cur.rowcount
+    conn.commit()
+    conn.close()
+    return updated > 0
+
+
 def fetch_unsubmitted_tasks(discord_user_id: int):
     """未提出タスクを締切昇順で取得"""
     conn = sqlite3.connect(DB_PATH)
@@ -144,7 +162,8 @@ async def task_add(
         f"登録者: {interaction.user.display_name}"
     )
     await interaction.response.send_message(msg, ephemeral=True)
-
+    
+# 未提出課題一覧表示（締切が近い順）
 @bot.tree.command(
     name="task_list",
     description="未提出の課題一覧を締切が近い順に表示します",
@@ -170,6 +189,27 @@ async def task_list(interaction: discord.Interaction):
 
     msg = "未提出の課題一覧（締切が近い順）\n" + "\n".join(lines)
     await interaction.response.send_message(msg, ephemeral=True)
+
+# 課題提出済みにする（ID指定）
+@bot.tree.command(
+    name="task_done",
+    description="課題を提出済みにします（ID指定）",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(task_id="提出済みにする課題のID（/task_list に表示されるID）")
+async def task_done(interaction: discord.Interaction, task_id: int):
+    ok = mark_task_submitted(interaction.user.id, task_id)
+
+    if ok:
+        await interaction.response.send_message(
+            f"課題（ID:{task_id}）を提出済みにしました。",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "指定IDの未提出課題が見つかりません。（ID違い / 既に提出済み / 他ユーザーの課題の可能性）",
+            ephemeral=True,
+        )
 
 # 通知テスト（指定チャンネルに送れるかチェック）
 @bot.tree.command(
